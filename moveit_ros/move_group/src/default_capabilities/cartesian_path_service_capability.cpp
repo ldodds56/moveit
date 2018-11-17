@@ -38,11 +38,13 @@
 #include <moveit/robot_state/conversions.h>
 #include <moveit/kinematic_constraints/utils.h>
 #include <moveit/collision_detection/collision_tools.h>
-#include <tf2_eigen/tf2_eigen.h>
+#include <eigen_conversions/eigen_msg.h>
 #include <moveit/move_group/capability_names.h>
 #include <moveit/planning_pipeline/planning_pipeline.h>
 #include <moveit_msgs/DisplayTrajectory.h>
 #include <moveit/trajectory_processing/iterative_time_parameterization.h>
+
+#include <algorithm>
 
 move_group::MoveGroupCartesianPathService::MoveGroupCartesianPathService()
   : MoveGroupCapability("CartesianPathService"), display_computed_paths_(true)
@@ -67,6 +69,19 @@ bool isStateValid(const planning_scene::PlanningScene* planning_scene,
   state->update();
   return (!planning_scene || !planning_scene->isStateColliding(*state, group->getName())) &&
          (!constraint_set || constraint_set->decide(*state).satisfied);
+}
+
+void computeConstantEefSpeedParametrization(robot_trajectory::RobotTrajectory& rt)
+{
+    auto durations = rt.getWayPointDurations();
+    double max_waypoint_duration = std::max_element(std::begin(durations), std::end(durations));
+
+    // start at i=1 because waypoint 0 corresponds to the starting pose and has
+    // duration 0
+    for(int i = 1; i < rt.getWayPointCount(); i++)
+    {
+	rt.setWayPointDurationFromPrevious(i, max_waypoint_duration);
+    }
 }
 }
 
@@ -95,14 +110,14 @@ bool move_group::MoveGroupCartesianPathService::computeService(moveit_msgs::GetC
     for (std::size_t i = 0; i < req.waypoints.size(); ++i)
     {
       if (no_transform)
-        tf2::fromMsg(req.waypoints[i], waypoints[i]);
+        tf::poseMsgToEigen(req.waypoints[i], waypoints[i]);
       else
       {
         geometry_msgs::PoseStamped p;
         p.header = req.header;
         p.pose = req.waypoints[i];
         if (performTransform(p, default_frame))
-          tf2::fromMsg(p.pose, waypoints[i]);
+          tf::poseMsgToEigen(p.pose, waypoints[i]);
         else
         {
           ROS_ERROR("Error encountered transforming waypoints to frame '%s'", default_frame.c_str());
@@ -155,7 +170,29 @@ bool move_group::MoveGroupCartesianPathService::computeService(moveit_msgs::GetC
           // time trajectory
           // \todo optionally compute timing to move the eef with constant speed
           trajectory_processing::IterativeParabolicTimeParameterization time_param;
-          time_param.computeTimeStamps(rt, 1.0);
+
+	  // Obtain velocity and acceleration scaling factors from ros params.
+	  double max_velocity_scaling_factor = 1.0;
+	  double max_acceleration_scaling_factor = 1.0;
+	  root_node_handle_.param("/move_group/cartesian_path_planning/max_velocity_scaling_factor",
+				     max_acceleration_scaling_factor, 1.0);
+	  root_node_handle_.param("/move_group/cartesian_path_planning/max_velocity_scaling_factor",
+				     max_acceleration_scaling_factor, 1.0);
+
+	  time_param.computeTimeStamps(rt, max_velocity_scaling_factor, max_acceleration_scaling_factor);
+
+	  // If requested, compute timing to move the eef with constant speed:
+	  // Because waypoints are separated by equal distance, finding the
+	  // largest time difference between subsequent waypoints will provide
+	  // a limit for the speed at which we can move -- then, just set all
+	  // time differences to this value to move at a constant speed.
+	  bool enable_eef_constant_speed = false;
+	  root_node_handle_.param("/move_group/cartesian_path_planning/enable_eef_constant_speed",
+				  enable_eef_constant_speed, false);
+	  if (enable_eef_constant_speed)
+	  {
+	      computeConstantEefSpeedParametrization(rt);
+	  }
 
           rt.getRobotTrajectoryMsg(res.solution);
           ROS_INFO("Computed Cartesian path with %u points (followed %lf%% of requested trajectory)",
@@ -181,5 +218,5 @@ bool move_group::MoveGroupCartesianPathService::computeService(moveit_msgs::GetC
   return true;
 }
 
-#include <class_loader/class_loader.hpp>
+#include <class_loader/class_loader.h>
 CLASS_LOADER_REGISTER_CLASS(move_group::MoveGroupCartesianPathService, move_group::MoveGroupCapability)
